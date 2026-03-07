@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+uv run uvicorn terminals.main:app --reload
