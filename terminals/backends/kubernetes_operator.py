@@ -30,10 +30,13 @@ log = logging.getLogger(__name__)
 _DNS_SAFE = re.compile(r"[^a-z0-9-]")
 
 
-def _sanitize_name(user_id: str) -> str:
-    """Deterministic, DNS-safe Terminal CR name from a user ID."""
+def _sanitize_name(user_id: str, policy_id: str = "default") -> str:
+    """Deterministic, DNS-safe Terminal CR name from a user ID + policy."""
     short = hashlib.sha256(user_id.encode()).hexdigest()[:12]
-    return f"terminal-{short}"
+    if policy_id == "default":
+        return f"terminal-{short}"
+    policy_slug = _DNS_SAFE.sub("-", policy_id.lower()).strip("-")[:20]
+    return f"terminal-{short}-{policy_slug}"
 
 
 class KubernetesOperatorBackend(Backend):
@@ -89,11 +92,13 @@ class KubernetesOperatorBackend(Backend):
                 return None
             raise
 
-    async def _get_terminal_cr(self, user_id: str) -> Optional[dict]:
-        """Get the Terminal CR for a user, or None if it doesn't exist."""
+    async def _get_terminal_cr(
+        self, user_id: str, policy_id: str = "default"
+    ) -> Optional[dict]:
+        """Get the Terminal CR for a user+policy, or None if it doesn't exist."""
         api_client = await self._ensure_client()
         custom = client.CustomObjectsApi(api_client)
-        name = _sanitize_name(user_id)
+        name = _sanitize_name(user_id, policy_id)
         ns = settings.kubernetes_namespace
         try:
             return await custom.get_namespaced_custom_object(
@@ -108,12 +113,54 @@ class KubernetesOperatorBackend(Backend):
                 return None
             raise
 
-    async def _create_terminal_cr(self, user_id: str) -> dict:
-        """Create a Terminal CR for a user and return it."""
+    async def _create_terminal_cr(
+        self,
+        user_id: str,
+        policy_id: str = "default",
+        spec: dict | None = None,
+    ) -> dict:
+        """Create a Terminal CR for a user+policy and return it."""
         api_client = await self._ensure_client()
         custom = client.CustomObjectsApi(api_client)
-        name = _sanitize_name(user_id)
+        name = _sanitize_name(user_id, policy_id)
         ns = settings.kubernetes_namespace
+        s = spec or {}
+
+        image = s.get("image", settings.kubernetes_image)
+        storage_size = s.get("storage")  # absent = ephemeral
+
+        # Build flat CRD spec aligned with policy schema
+        cr_spec: dict = {
+            "userId": user_id,
+            "image": image,
+        }
+
+        # CPU / memory limits (flat — no nesting)
+        if s.get("cpu_limit"):
+            cr_spec["cpuLimit"] = s["cpu_limit"]
+        if s.get("memory_limit"):
+            cr_spec["memoryLimit"] = s["memory_limit"]
+
+        # Storage: present = persistent, absent = ephemeral
+        if storage_size:
+            cr_spec["storage"] = storage_size
+            if settings.kubernetes_storage_class:
+                cr_spec["storageClass"] = settings.kubernetes_storage_class
+            # Storage mode (per-user, shared, shared-rwo)
+            storage_mode = s.get("storage_mode", settings.kubernetes_storage_mode)
+            cr_spec["storageMode"] = storage_mode
+
+        # Env vars
+        env = s.get("env", {})
+        if env:
+            cr_spec["env"] = env
+
+        # Idle timeout
+        idle_timeout = s.get("idle_timeout_minutes", settings.idle_timeout_minutes)
+        if idle_timeout and idle_timeout > 0:
+            cr_spec["idleTimeoutMinutes"] = idle_timeout
+
+        policy_slug = _DNS_SAFE.sub("-", policy_id.lower()).strip("-")[:20]
 
         cr = {
             "apiVersion": f"{self._group}/{self._version}",
@@ -125,30 +172,10 @@ class KubernetesOperatorBackend(Backend):
                     "app.kubernetes.io/managed-by": "terminals",
                     "app.kubernetes.io/part-of": "open-terminal",
                     "openwebui.com/user-id": user_id,
+                    "openwebui.com/policy": policy_slug,
                 },
             },
-            "spec": {
-                "userId": user_id,
-                "image": settings.kubernetes_image,
-                "resources": {
-                    "requests": {
-                        "cpu": settings.kubernetes_default_cpu_request,
-                        "memory": settings.kubernetes_default_memory_request,
-                    },
-                    "limits": {
-                        "cpu": settings.kubernetes_default_cpu_limit,
-                        "memory": settings.kubernetes_default_memory_limit,
-                    },
-                },
-                "idleTimeoutMinutes": settings.kubernetes_default_idle_timeout_minutes,
-                "packages": [],
-                "pipPackages": [],
-                "persistence": {
-                    "enabled": settings.kubernetes_default_persistence_enabled,
-                    "size": settings.kubernetes_default_persistence_size,
-                    "storageClass": settings.kubernetes_storage_class or "",
-                },
-            },
+            "spec": cr_spec,
         }
 
         try:
@@ -162,10 +189,10 @@ class KubernetesOperatorBackend(Backend):
         except client.exceptions.ApiException as exc:
             if exc.status == 409:
                 # Already exists — but may be mid-deletion (finalizer pending).
-                existing = await self._get_terminal_cr(user_id)
+                existing = await self._get_terminal_cr(user_id, policy_id)
                 if existing and existing.get("metadata", {}).get("deletionTimestamp"):
                     # CR is being deleted; wait for it to vanish, then retry create
-                    await self._wait_for_deletion(user_id, timeout=60)
+                    await self._wait_for_deletion(user_id, policy_id, timeout=60)
                     return await custom.create_namespaced_custom_object(
                         group=self._group,
                         version=self._version,
@@ -185,15 +212,21 @@ class KubernetesOperatorBackend(Backend):
                 )
             raise
 
-    async def _delete_terminal_cr(self, user_id: str, wait: bool = True, timeout: int = 60) -> bool:
-        """Delete the Terminal CR for a user and optionally wait for it to be gone.
+    async def _delete_terminal_cr(
+        self,
+        user_id: str,
+        policy_id: str = "default",
+        wait: bool = True,
+        timeout: int = 60,
+    ) -> bool:
+        """Delete the Terminal CR for a user+policy and optionally wait for it to be gone.
 
         When *wait* is True (default), polls until the CR returns 404 so that
         a subsequent create won't collide with the kopf finalizer.
         """
         api_client = await self._ensure_client()
         custom = client.CustomObjectsApi(api_client)
-        name = _sanitize_name(user_id)
+        name = _sanitize_name(user_id, policy_id)
         ns = settings.kubernetes_namespace
         try:
             await custom.delete_namespaced_custom_object(
@@ -231,11 +264,13 @@ class KubernetesOperatorBackend(Backend):
         log.warning("Terminal CR %s not fully deleted after %ds", name, timeout)
         return True
 
-    async def _wait_for_deletion(self, user_id: str, timeout: int = 60) -> None:
+    async def _wait_for_deletion(
+        self, user_id: str, policy_id: str = "default", timeout: int = 60
+    ) -> None:
         """Poll until a Terminal CR no longer exists (404)."""
         api_client = await self._ensure_client()
         custom = client.CustomObjectsApi(api_client)
-        name = _sanitize_name(user_id)
+        name = _sanitize_name(user_id, policy_id)
         ns = settings.kubernetes_namespace
 
         deadline = asyncio.get_event_loop().time() + timeout
@@ -344,7 +379,7 @@ class KubernetesOperatorBackend(Backend):
 
         Returns connection info dict or ``None`` on timeout.
         """
-        cr = await self._create_terminal_cr(user_id)
+        cr = await self._create_terminal_cr(user_id, policy_id=policy_id, spec=spec)
         name = cr["metadata"]["name"]
         ns = settings.kubernetes_namespace
 
@@ -449,7 +484,7 @@ class KubernetesOperatorBackend(Backend):
             self._api_client = None
 
     # ------------------------------------------------------------------
-    # DB-free operation
+    # Operator-aware ensure_terminal
     # ------------------------------------------------------------------
 
     async def ensure_terminal(
@@ -468,18 +503,18 @@ class KubernetesOperatorBackend(Backend):
 
         Returns a dict with ``api_key``, ``host``, ``port`` or ``None``.
         """
-        cr = await self._get_terminal_cr(user_id)
+        cr = await self._get_terminal_cr(user_id, policy_id)
 
         if cr is None:
-            return await self.provision(user_id)
+            return await self.provision(user_id, policy_id=policy_id, spec=spec)
 
         status = cr.get("status") or {}
         phase = status.get("phase")
 
         if phase == "Idle":
             # Terminal was idled — delete and re-create to spawn a fresh pod
-            await self._delete_terminal_cr(user_id)
-            return await self.provision(user_id)
+            await self._delete_terminal_cr(user_id, policy_id)
+            return await self.provision(user_id, policy_id=policy_id, spec=spec)
 
         if phase == "Running" and status.get("serviceUrl") and status.get("apiKeySecret"):
             api_key = await self._read_api_key_from_secret(status["apiKeySecret"])
@@ -538,7 +573,7 @@ class KubernetesOperatorBackend(Backend):
         """Update lastActivityAt on the Terminal CR to prevent idle culling."""
         api_client = await self._ensure_client()
         custom = client.CustomObjectsApi(api_client)
-        name = _sanitize_name(user_id)
+        name = _sanitize_name(user_id, policy_id)
         ns = settings.kubernetes_namespace
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
