@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     kubernetes_image: str = "ghcr.io/open-webui/open-terminal:latest"
     kubernetes_storage_class: str = ""        # empty = cluster default
     kubernetes_storage_size: str = "1Gi"
+    kubernetes_storage_mode: str = "per-user"  # per-user, shared, shared-rwo
     kubernetes_service_type: str = "ClusterIP"
     kubernetes_kubeconfig: str = ""           # empty = in-cluster config
     kubernetes_labels: str = ""               # extra labels as "k=v,k2=v2"

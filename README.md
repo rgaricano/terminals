@@ -69,6 +69,7 @@ curl -X POST http://localhost:3000/p/data-science/execute \
 | `cpu_limit` | string | Max CPU (e.g. `"2"`) |
 | `memory_limit` | string | Max memory (e.g. `"4Gi"`) |
 | `storage` | string | Persistent volume size (absent = ephemeral) |
+| `storage_mode` | string | `per-user`, `shared`, `shared-rwo` (absent = global default) |
 | `allowed_domains` | list | `["*"]` = full, `[]` = none, `["*.pypi.org"]` = restricted |
 | `idle_timeout_minutes` | int | Idle timeout before cleanup |
 
@@ -86,6 +87,7 @@ Environment variables prefixed with `TERMINALS_` (or `.env` file).
 | `TERMINALS_MAX_MEMORY` | | Hard cap on memory |
 | `TERMINALS_MAX_STORAGE` | | Hard cap on storage |
 | `TERMINALS_ALLOWED_IMAGES` | | Comma-separated image globs |
+| `TERMINALS_KUBERNETES_STORAGE_MODE` | `per-user` | `per-user`, `shared`, `shared-rwo` |
 
 See [`config.py`](terminals/config.py) for the full list.
 

@@ -79,86 +79,132 @@ class KubernetesBackend(Backend):
     ) -> dict:
         api_client = await self._ensure_client()
         core = client.CoreV1Api(api_client)
+        s = spec or {}
 
         api_key = secrets.token_urlsafe(24)
         base_name = _sanitize_name(user_id)
-        # Include template in resource names for multi-template support
-        tmpl_slug = _DNS_SAFE.sub("-", policy_id.lower()).strip("-")[:20]
-        name = f"{base_name}-{tmpl_slug}" if policy_id != "default" else base_name
+        policy_slug = _DNS_SAFE.sub("-", policy_id.lower()).strip("-")[:20]
+        name = f"{base_name}-{policy_slug}" if policy_id != "default" else base_name
         ns = settings.kubernetes_namespace
         labels = _base_labels(user_id)
-        labels["openwebui.com/policy"] = tmpl_slug
+        labels["openwebui.com/policy"] = policy_slug
 
-        # Resolve image and container settings from spec or defaults
-        container_spec = (spec or {}).get("container", {})
-        image = container_spec.get("image", settings.kubernetes_image)
-        sec_spec = container_spec.get("securityContext", {})
-        res_spec = container_spec.get("resources", {})
+        image = s.get("image", settings.kubernetes_image)
+        storage_mode = s.get("storage_mode", settings.kubernetes_storage_mode)
+        storage_size = s.get("storage", settings.kubernetes_storage_size)
 
-        # ---- Optional PVC ------------------------------------------------
-        if settings.kubernetes_storage_size:
-            pvc = client.V1PersistentVolumeClaim(
-                metadata=client.V1ObjectMeta(name=name, namespace=ns, labels=labels),
-                spec=client.V1PersistentVolumeClaimSpec(
-                    access_modes=["ReadWriteOnce"],
-                    resources=client.V1VolumeResourceRequirements(
-                        requests={"storage": settings.kubernetes_storage_size},
-                    ),
-                    **(
-                        {"storage_class_name": settings.kubernetes_storage_class}
-                        if settings.kubernetes_storage_class
-                        else {}
-                    ),
-                ),
-            )
-            try:
-                await core.create_namespaced_persistent_volume_claim(ns, pvc)
-                log.info("Created PVC %s in %s", name, ns)
-            except client.exceptions.ApiException as exc:
-                if exc.status == 409:
-                    log.debug("PVC %s already exists", name)
-                else:
-                    raise
+        # ---- Env vars ----------------------------------------------------
+        env_vars = [
+            client.V1EnvVar(name="OPEN_TERMINAL_API_KEY", value=api_key),
+        ]
+        for k, v in s.get("env", {}).items():
+            env_vars.append(client.V1EnvVar(name=k, value=str(v)))
 
-        # ---- Build K8s objects from spec ----------------------------------
-        # Security context
-        security_context = None
-        if sec_spec:
-            security_context = client.V1SecurityContext(
-                run_as_user=sec_spec.get("runAsUser"),
-                run_as_group=sec_spec.get("runAsGroup"),
-                allow_privilege_escalation=sec_spec.get("allowPrivilegeEscalation"),
-                read_only_root_filesystem=sec_spec.get("readOnlyRootFilesystem"),
-                capabilities=client.V1Capabilities(
-                    drop=sec_spec.get("capabilities", {}).get("drop"),
-                    add=sec_spec.get("capabilities", {}).get("add"),
-                ) if sec_spec.get("capabilities") else None,
-            )
-
-        # Resource requirements
+        # ---- Resource requirements ---------------------------------------
         resource_reqs = None
-        if res_spec:
-            resource_reqs = client.V1ResourceRequirements(
-                requests=res_spec.get("requests"),
-                limits=res_spec.get("limits"),
-            )
+        limits = {}
+        if s.get("cpu_limit"):
+            limits["cpu"] = s["cpu_limit"]
+        if s.get("memory_limit"):
+            limits["memory"] = s["memory_limit"]
+        if limits:
+            resource_reqs = client.V1ResourceRequirements(limits=limits)
 
-        # ---- Pod ---------------------------------------------------------
+        # ---- Storage (3 modes) -------------------------------------------
         volumes = []
         volume_mounts = []
-        if settings.kubernetes_storage_size:
-            volumes.append(
-                client.V1Volume(
-                    name="home",
-                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                        claim_name=name,
+        affinity = None
+        shared_pvc_name = f"terminals-shared-{ns}"
+
+        if storage_size:
+            if storage_mode == "per-user":
+                # Each user gets their own PVC
+                pvc = client.V1PersistentVolumeClaim(
+                    metadata=client.V1ObjectMeta(name=name, namespace=ns, labels=labels),
+                    spec=client.V1PersistentVolumeClaimSpec(
+                        access_modes=["ReadWriteOnce"],
+                        resources=client.V1VolumeResourceRequirements(
+                            requests={"storage": storage_size},
+                        ),
+                        **(
+                            {"storage_class_name": settings.kubernetes_storage_class}
+                            if settings.kubernetes_storage_class
+                            else {}
+                        ),
                     ),
                 )
-            )
-            volume_mounts.append(
-                client.V1VolumeMount(name="home", mount_path="/home/user"),
-            )
+                try:
+                    await core.create_namespaced_persistent_volume_claim(ns, pvc)
+                    log.info("Created PVC %s in %s", name, ns)
+                except client.exceptions.ApiException as exc:
+                    if exc.status != 409:
+                        raise
+                volumes.append(
+                    client.V1Volume(
+                        name="home",
+                        persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                            claim_name=name,
+                        ),
+                    )
+                )
+                volume_mounts.append(
+                    client.V1VolumeMount(name="home", mount_path="/home/user"),
+                )
 
+            elif storage_mode == "shared":
+                # Single RWX PVC shared across all users, subPath per user
+                await self._ensure_shared_pvc(core, ns, shared_pvc_name, storage_size, "ReadWriteMany")
+                volumes.append(
+                    client.V1Volume(
+                        name="home",
+                        persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                            claim_name=shared_pvc_name,
+                        ),
+                    )
+                )
+                volume_mounts.append(
+                    client.V1VolumeMount(
+                        name="home",
+                        mount_path="/home/user",
+                        sub_path=user_id,
+                    ),
+                )
+
+            elif storage_mode == "shared-rwo":
+                # Single RWO PVC, all pods on same node via affinity
+                await self._ensure_shared_pvc(core, ns, shared_pvc_name, storage_size, "ReadWriteOnce")
+                volumes.append(
+                    client.V1Volume(
+                        name="home",
+                        persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                            claim_name=shared_pvc_name,
+                        ),
+                    )
+                )
+                volume_mounts.append(
+                    client.V1VolumeMount(
+                        name="home",
+                        mount_path="/home/user",
+                        sub_path=user_id,
+                    ),
+                )
+                # Pin all terminal pods to the same node as the PVC
+                affinity = client.V1Affinity(
+                    pod_affinity=client.V1PodAffinity(
+                        required_during_scheduling_ignored_during_execution=[
+                            client.V1PodAffinityTerm(
+                                label_selector=client.V1LabelSelector(
+                                    match_labels={
+                                        "app.kubernetes.io/managed-by": "terminals",
+                                    }
+                                ),
+                                topology_key="kubernetes.io/hostname",
+                            )
+                        ]
+                    )
+                )
+
+        # ---- Pod ---------------------------------------------------------
         pod = client.V1Pod(
             metadata=client.V1ObjectMeta(name=name, namespace=ns, labels=labels),
             spec=client.V1PodSpec(
@@ -167,13 +213,8 @@ class KubernetesBackend(Backend):
                         name="open-terminal",
                         image=image,
                         ports=[client.V1ContainerPort(container_port=8000)],
-                        env=[
-                            client.V1EnvVar(
-                                name="OPEN_TERMINAL_API_KEY", value=api_key
-                            ),
-                        ],
+                        env=env_vars,
                         volume_mounts=volume_mounts or None,
-                        security_context=security_context,
                         resources=resource_reqs,
                         readiness_probe=client.V1Probe(
                             http_get=client.V1HTTPGetAction(
@@ -185,16 +226,16 @@ class KubernetesBackend(Backend):
                     )
                 ],
                 volumes=volumes or None,
+                affinity=affinity,
                 restart_policy="Always",
             ),
         )
 
         try:
             created = await core.create_namespaced_pod(ns, pod)
-            log.info("Created Pod %s in %s (policy=%s)", name, ns, policy_id)
+            log.info("Created Pod %s in %s (policy=%s, storage=%s)", name, ns, policy_id, storage_mode)
         except client.exceptions.ApiException as exc:
             if exc.status == 409:
-                # Pod exists — delete and recreate.
                 log.info("Pod %s already exists, replacing", name)
                 await core.delete_namespaced_pod(name, ns)
                 created = await core.create_namespaced_pod(ns, pod)
@@ -204,15 +245,14 @@ class KubernetesBackend(Backend):
         instance_id = created.metadata.uid
 
         # ---- Service -----------------------------------------------------
-        svc_selector = {
-            "openwebui.com/user-id": user_id,
-            "openwebui.com/template": tmpl_slug,
-        }
         svc = client.V1Service(
             metadata=client.V1ObjectMeta(name=name, namespace=ns, labels=labels),
             spec=client.V1ServiceSpec(
                 type=settings.kubernetes_service_type,
-                selector=svc_selector,
+                selector={
+                    "openwebui.com/user-id": user_id,
+                    "openwebui.com/policy": policy_slug,
+                },
                 ports=[
                     client.V1ServicePort(port=8000, target_port=8000),
                 ],
@@ -222,9 +262,7 @@ class KubernetesBackend(Backend):
             await core.create_namespaced_service(ns, svc)
             log.info("Created Service %s in %s", name, ns)
         except client.exceptions.ApiException as exc:
-            if exc.status == 409:
-                log.debug("Service %s already exists", name)
-            else:
+            if exc.status != 409:
                 raise
 
         host = f"{name}.{ns}.svc.cluster.local"
@@ -316,3 +354,40 @@ class KubernetesBackend(Backend):
         except client.exceptions.ApiException:
             pass
         return None
+
+    async def _ensure_shared_pvc(
+        self,
+        core: client.CoreV1Api,
+        ns: str,
+        name: str,
+        size: str,
+        access_mode: str,
+    ) -> None:
+        """Create the shared PVC if it doesn't already exist."""
+        pvc = client.V1PersistentVolumeClaim(
+            metadata=client.V1ObjectMeta(
+                name=name,
+                namespace=ns,
+                labels={
+                    "app.kubernetes.io/managed-by": "terminals",
+                    "app.kubernetes.io/part-of": "open-terminal",
+                },
+            ),
+            spec=client.V1PersistentVolumeClaimSpec(
+                access_modes=[access_mode],
+                resources=client.V1VolumeResourceRequirements(
+                    requests={"storage": size},
+                ),
+                **(
+                    {"storage_class_name": settings.kubernetes_storage_class}
+                    if settings.kubernetes_storage_class
+                    else {}
+                ),
+            ),
+        )
+        try:
+            await core.create_namespaced_persistent_volume_claim(ns, pvc)
+            log.info("Created shared PVC %s in %s (%s)", name, ns, access_mode)
+        except client.exceptions.ApiException as exc:
+            if exc.status != 409:
+                raise
