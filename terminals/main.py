@@ -24,9 +24,11 @@ async def lifespan(app: FastAPI):
     await init_db()
 
     app.state.backend = create_backend()
+    app.state.backend.start_reaper()
 
     yield
 
+    await app.state.backend.stop_reaper()
     await close_proxy_client()
     await app.state.backend.close()
     await close_db()

@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     kubernetes_crd_group: str = "openwebui.com"
     kubernetes_crd_version: str = "v1alpha1"
 
+    # Idle reaper — tear down terminals after N minutes of inactivity (0 = disabled)
+    idle_timeout_minutes: int = 0
+
     # Policy hard caps (cannot be exceeded by API)
     max_cpu: str = ""              # TERMINALS_MAX_CPU
     max_memory: str = ""           # TERMINALS_MAX_MEMORY

@@ -45,6 +45,7 @@ class KubernetesOperatorBackend(Backend):
     """
 
     def __init__(self) -> None:
+        super().__init__()
         self._api_client: Optional[ApiClient] = None
 
     async def _ensure_client(self) -> ApiClient:
@@ -333,7 +334,12 @@ class KubernetesOperatorBackend(Backend):
     # Backend interface
     # ------------------------------------------------------------------
 
-    async def provision(self, user_id: str) -> Optional[dict]:
+    async def provision(
+        self,
+        user_id: str,
+        policy_id: str = "default",
+        spec: dict | None = None,
+    ) -> Optional[dict]:
         """Create a Terminal CR and wait for it to become ready.
 
         Returns connection info dict or ``None`` on timeout.
@@ -446,7 +452,12 @@ class KubernetesOperatorBackend(Backend):
     # DB-free operation
     # ------------------------------------------------------------------
 
-    async def ensure_terminal(self, user_id: str) -> Optional[dict]:
+    async def ensure_terminal(
+        self,
+        user_id: str,
+        policy_id: str = "default",
+        spec: Optional[dict] = None,
+    ) -> Optional[dict]:
         """Get or create a terminal, resolving from K8s CRDs.
 
         Mirrors the reference ``ensure_terminal`` pattern:
@@ -521,7 +532,9 @@ class KubernetesOperatorBackend(Backend):
 
         return None
 
-    async def touch_activity(self, user_id: str) -> None:
+    async def touch_activity(
+        self, user_id: str, policy_id: str = "default"
+    ) -> None:
         """Update lastActivityAt on the Terminal CR to prevent idle culling."""
         api_client = await self._ensure_client()
         custom = client.CustomObjectsApi(api_client)

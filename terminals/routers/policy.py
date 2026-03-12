@@ -26,7 +26,6 @@ class PolicyData(BaseModel):
     memory_limit: Optional[str] = None
     storage: Optional[str] = None        # e.g. "5Gi" — absent = ephemeral
     storage_mode: Optional[str] = None   # per-user, shared, shared-rwo
-    allowed_domains: Optional[list] = None  # ["*"] = full, [] = none
     idle_timeout_minutes: Optional[int] = None
 
 

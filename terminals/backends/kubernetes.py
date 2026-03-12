@@ -54,6 +54,7 @@ class KubernetesBackend(Backend):
     """Manage terminal instances as Kubernetes Pods + Services."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._api_client: Optional[ApiClient] = None
 
     async def _ensure_client(self) -> ApiClient:
@@ -97,8 +98,13 @@ class KubernetesBackend(Backend):
         env_vars = [
             client.V1EnvVar(name="OPEN_TERMINAL_API_KEY", value=api_key),
         ]
-        for k, v in s.get("env", {}).items():
+        policy_env = s.get("env", {})
+        for k, v in policy_env.items():
             env_vars.append(client.V1EnvVar(name=k, value=str(v)))
+
+        # Egress filtering is handled inside the container (dnsmasq + ipset +
+        # iptables + capsh) triggered by OPEN_TERMINAL_ALLOWED_DOMAINS env var.
+        has_egress_policy = "OPEN_TERMINAL_ALLOWED_DOMAINS" in policy_env
 
         # ---- Resource requirements ---------------------------------------
         resource_reqs = None
@@ -216,6 +222,11 @@ class KubernetesBackend(Backend):
                         env=env_vars,
                         volume_mounts=volume_mounts or None,
                         resources=resource_reqs,
+                        security_context=client.V1SecurityContext(
+                            capabilities=client.V1Capabilities(
+                                add=["NET_ADMIN"],
+                            ),
+                        ) if has_egress_policy else None,
                         readiness_probe=client.V1Probe(
                             http_get=client.V1HTTPGetAction(
                                 path="/health", port=8000

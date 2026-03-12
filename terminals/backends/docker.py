@@ -16,6 +16,7 @@ class DockerBackend(Backend):
     """Manage terminal instances as Docker containers."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._docker: Optional[aiodocker.Docker] = None
 
     async def _get_docker(self) -> aiodocker.Docker:
@@ -51,16 +52,19 @@ class DockerBackend(Backend):
         if s.get("cpu_limit"):
             host_config["NanoCpus"] = self._parse_cpu_nanos(s["cpu_limit"])
 
-        # Network
-        allowed = s.get("allowed_domains")
-        if allowed is not None and len(allowed) == 0:
-            host_config["NetworkMode"] = "none"
-        elif settings.network:
+        # Egress filtering is handled inside the container (dnsmasq + ipset +
+        # iptables + capsh) triggered by OPEN_TERMINAL_ALLOWED_DOMAINS env var.
+        # Grant CAP_NET_ADMIN so the entrypoint can set up iptables rules
+        # (the capability gets permanently dropped via capsh after setup).
+        policy_env = s.get("env", {})
+        if "OPEN_TERMINAL_ALLOWED_DOMAINS" in policy_env:
+            host_config["CapAdd"] = ["NET_ADMIN"]
+        if settings.network:
             host_config["NetworkMode"] = settings.network
 
         # Env vars
         env = [f"OPEN_TERMINAL_API_KEY={api_key}"]
-        for k, v in s.get("env", {}).items():
+        for k, v in policy_env.items():
             env.append(f"{k}={v}")
 
         config: dict = {
@@ -86,7 +90,7 @@ class DockerBackend(Backend):
         instance_id = info["Id"]
 
         host = instance_name
-        if not settings.network and (allowed is None or len(allowed) > 0):
+        if not settings.network:
             networks = info.get("NetworkSettings", {}).get("Networks", {})
             bridge = networks.get("bridge", {})
             host = bridge.get("IPAddress", "127.0.0.1")

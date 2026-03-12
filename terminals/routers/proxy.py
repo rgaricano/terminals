@@ -100,7 +100,7 @@ async def _resolve_instance(
     if info is None:
         raise RuntimeError(f"Failed to provision terminal for user {user_id}")
     try:
-        await backend.touch_activity(user_id)
+        await backend.touch_activity(user_id, policy_id=policy_id)
     except Exception:
         logger.debug("touch_activity failed for user {}", user_id)
     return InstanceInfo(
