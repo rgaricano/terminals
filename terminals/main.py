@@ -1,11 +1,9 @@
 """FastAPI application assembly."""
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from terminals.backends import create_backend
 from terminals.config import settings
@@ -64,10 +62,3 @@ app.include_router(policy_router)
 # Catch-all proxy router must be last so /health and /api are matched first.
 app.include_router(proxy_router)
 
-
-# ---------------------------------------------------------------------------
-# Serve the SvelteKit static frontend (must be last — catch-all mount)
-# ---------------------------------------------------------------------------
-_FRONTEND_DIR = Path(__file__).resolve().parent / "frontend" / "build"
-if _FRONTEND_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
