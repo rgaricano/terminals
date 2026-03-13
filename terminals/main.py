@@ -22,6 +22,11 @@ async def lifespan(app: FastAPI):
     init_db()
 
     app.state.backend = create_backend()
+
+    # Recover state from any running containers (survives process restart).
+    if hasattr(app.state.backend, "reconcile"):
+        await app.state.backend.reconcile()
+
     app.state.backend.start_reaper()
 
     yield

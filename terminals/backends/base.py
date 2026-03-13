@@ -25,6 +25,7 @@ class Backend(ABC):
         self._activity: dict[str, float] = {}      # → last-active unix timestamp
         self._instances: dict[str, dict] = {}       # → provision result dict
         self._specs: dict[str, dict] = {}           # → resolved policy spec
+        self._locks: dict[str, asyncio.Lock] = {}   # → per-key provisioning lock
         self._reaper_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
@@ -82,27 +83,43 @@ class Backend(ABC):
 
         Returns a dict with ``api_key``, ``host``, ``port``, or ``None``.
         Tracks the instance for idle reaping.
+
+        Uses a per-key lock so concurrent requests for the same user+policy
+        don't race to provision the same container.
         """
         key = self._key(user_id, policy_id)
 
-        # If we already have a tracked instance, check it's still alive.
+        # Fast path — already tracked and running.
         if key in self._instances:
             info = self._instances[key]
             st = await self.status(info["instance_id"])
             if st == "running":
                 self._activity[key] = time.monotonic()
                 return info
-            # Gone — clean up tracking and re-provision.
-            self._instances.pop(key, None)
-            self._specs.pop(key, None)
-            self._activity.pop(key, None)
 
-        result = await self.provision(user_id, policy_id=policy_id, spec=spec)
-        if result:
-            self._instances[key] = result
-            self._specs[key] = spec or {}
-            self._activity[key] = time.monotonic()
-        return result
+        # Serialise provisioning per key.
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+
+        async with self._locks[key]:
+            # Re-check after acquiring lock — another request may have
+            # already provisioned while we were waiting.
+            if key in self._instances:
+                info = self._instances[key]
+                st = await self.status(info["instance_id"])
+                if st == "running":
+                    self._activity[key] = time.monotonic()
+                    return info
+                self._instances.pop(key, None)
+                self._specs.pop(key, None)
+                self._activity.pop(key, None)
+
+            result = await self.provision(user_id, policy_id=policy_id, spec=spec)
+            if result:
+                self._instances[key] = result
+                self._specs[key] = spec or {}
+                self._activity[key] = time.monotonic()
+            return result
 
     async def get_terminal_info(self, user_id: str) -> Optional[dict]:
         """Look up an existing terminal without creating one."""

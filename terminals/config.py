@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # Docker settings
     image: str = "ghcr.io/open-webui/open-terminal:latest"
     network: str = ""
+    docker_host: str = "127.0.0.1"  # address to reach published container ports
     data_dir: str = "./data/terminals"
 
     port: int = 3000

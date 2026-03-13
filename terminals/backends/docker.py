@@ -1,7 +1,9 @@
 """Docker backend — provisions Open Terminal inside containers via aiodocker."""
 
+import asyncio
 import logging
 import secrets
+from pathlib import Path
 from typing import Optional
 
 import aiodocker
@@ -10,6 +12,9 @@ from terminals.backends.base import Backend
 from terminals.config import settings
 
 log = logging.getLogger(__name__)
+
+# Container name prefix used for discovery during reconciliation.
+_CONTAINER_PREFIX = "terminals-"
 
 
 class DockerBackend(Backend):
@@ -24,6 +29,11 @@ class DockerBackend(Backend):
             self._docker = aiodocker.Docker()
         return self._docker
 
+    @staticmethod
+    def _container_name(policy_id: str, user_id: str) -> str:
+        """Build the deterministic container name."""
+        return f"{_CONTAINER_PREFIX}{policy_id}--{user_id}"
+
     # ------------------------------------------------------------------
     # Backend interface
     # ------------------------------------------------------------------
@@ -36,14 +46,15 @@ class DockerBackend(Backend):
     ) -> dict:
         docker = await self._get_docker()
         api_key = secrets.token_urlsafe(24)
-        instance_name = f"terminals-{user_id}-{policy_id}"
-        host_data_dir = f"{settings.data_dir}/{user_id}"
+        instance_name = self._container_name(policy_id, user_id)
+        host_data_dir = str((Path(settings.data_dir) / user_id).resolve())
         s = spec or {}
 
         image = s.get("image", settings.image)
 
         host_config: dict = {
             "Binds": [f"{host_data_dir}:/home/user"],
+            "PublishAllPorts": True,
         }
 
         # Resources
@@ -83,25 +94,137 @@ class DockerBackend(Backend):
             )
             await container.start()
         except aiodocker.exceptions.DockerError as exc:
-            log.error("Failed to provision container for %s: %s", user_id, exc)
-            raise
+            if exc.status == 409:
+                # Container name conflict (e.g. stale container being removed).
+                # Force-remove and retry.
+                log.warning("Container %s conflict, force-removing and retrying", instance_name)
+                try:
+                    old = await docker.containers.get(instance_name)
+                    await old.delete(force=True)
+                except aiodocker.exceptions.DockerError:
+                    pass
+                await asyncio.sleep(1)
+                container = await docker.containers.create_or_replace(
+                    name=instance_name,
+                    config=config,
+                )
+                await container.start()
+            else:
+                log.error("Failed to provision container for %s: %s", user_id, exc)
+                raise
 
+        result = await self._extract_instance_info(container, instance_name, api_key)
+        await self._wait_until_ready(result, timeout=15)
+        return result
+
+    async def _wait_until_ready(self, instance: dict, timeout: int = 15) -> None:
+        """Poll the container's /health endpoint until it responds."""
+        import httpx
+
+        url = f"http://{instance['host']}:{instance['port']}/health"
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                async with httpx.AsyncClient(timeout=3) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        log.info("Container %s is ready", instance["instance_name"])
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        log.warning("Container %s did not become ready within %ds", instance["instance_name"], timeout)
+
+    async def _extract_instance_info(
+        self,
+        container,
+        instance_name: str,
+        api_key: str,
+    ) -> dict:
+        """Read container metadata and return the instance info dict."""
         info = await container.show()
         instance_id = info["Id"]
 
-        host = instance_name
-        if not settings.network:
-            networks = info.get("NetworkSettings", {}).get("Networks", {})
-            bridge = networks.get("bridge", {})
-            host = bridge.get("IPAddress", "127.0.0.1")
+        # When using a custom Docker network, containers can reach each other
+        # by name.  Otherwise, use the published port on the Docker host.
+        if settings.network:
+            host = instance_name
+            port = 8000
+        else:
+            port_bindings = (
+                info.get("NetworkSettings", {})
+                .get("Ports", {})
+                .get("8000/tcp", [])
+            )
+            if port_bindings:
+                port = int(port_bindings[0]["HostPort"])
+            else:
+                port = 8000
+            host = settings.docker_host
 
         return {
             "instance_id": instance_id,
             "instance_name": instance_name,
             "api_key": api_key,
             "host": host,
-            "port": 8000,
+            "port": port,
         }
+
+    # ------------------------------------------------------------------
+    # Reconciliation — rediscover running containers on startup
+    # ------------------------------------------------------------------
+
+    async def reconcile(self) -> None:
+        """Scan running Docker containers and repopulate ``_instances``.
+
+        Called during startup to recover state after a restart without
+        tearing down existing containers.  The API key stored in each
+        container's env (``OPEN_TERMINAL_API_KEY``) is extracted so the
+        proxy can authenticate against the instance.
+        """
+        docker = await self._get_docker()
+        containers = await docker.containers.list(
+            filters={"name": [_CONTAINER_PREFIX], "status": ["running"]},
+        )
+
+        recovered = 0
+        for container in containers:
+            info = await container.show()
+            name = info.get("Name", "").lstrip("/")
+
+            if not name.startswith(_CONTAINER_PREFIX):
+                continue
+
+            # Parse: terminals-{policy_id}--{user_id}
+            suffix = name[len(_CONTAINER_PREFIX):]
+            parts = suffix.split("--", 1)
+            if len(parts) != 2:
+                log.debug("Skipping container with unexpected name: %s", name)
+                continue
+
+            policy_id, user_id = parts
+            key = self._key(user_id, policy_id)
+
+            # Already tracked
+            if key in self._instances:
+                continue
+
+            # Extract API key from container env
+            env_list = info.get("Config", {}).get("Env", [])
+            api_key = ""
+            for entry in env_list:
+                if entry.startswith("OPEN_TERMINAL_API_KEY="):
+                    api_key = entry.split("=", 1)[1]
+                    break
+
+            instance_info = await self._extract_instance_info(container, name, api_key)
+            self._instances[key] = instance_info
+            self._activity[key] = __import__("time").monotonic()
+            recovered += 1
+            log.info("Reconciled container %s → %s:%s", name, instance_info["host"], instance_info["port"])
+
+        if recovered:
+            log.info("Reconciled %d running container(s)", recovered)
 
     # ------------------------------------------------------------------
     # Resource parsing helpers

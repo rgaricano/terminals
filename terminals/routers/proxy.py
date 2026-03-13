@@ -141,12 +141,30 @@ async def _proxy_request(
     body = await request.body()
 
     client = await _get_proxy_client()
-    upstream = await client.request(
-        method=request.method,
-        url=target_url,
-        headers=headers,
-        content=body,
-    )
+
+    # Retry on connection errors — the container may still be starting.
+    import httpx
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            upstream = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=body,
+            )
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            if attempt < max_retries - 1:
+                logger.debug("Proxy attempt {} to {} failed ({}), retrying...", attempt + 1, target_url, e)
+                await asyncio.sleep(1)
+            else:
+                logger.error("Proxy request to {} failed after {} retries: {}", target_url, max_retries, e)
+                return Response(
+                    content=f'{{"error": "Terminal instance not reachable"}}',
+                    status_code=502,
+                    media_type="application/json",
+                )
 
     # Strip hop-by-hop from response too.
     response_headers = dict(upstream.headers)
@@ -170,6 +188,44 @@ _cached_spec_ts: float = 0.0
 
 _SYSTEM_USER_ID = "system"
 
+# Max retries when waiting for a freshly provisioned container to become ready.
+_SPEC_FETCH_RETRIES = 10
+_SPEC_FETCH_DELAY = 1  # seconds between retries
+
+
+async def _fetch_spec_with_retry(instance: InstanceInfo) -> dict:
+    """Fetch the OpenAPI spec from an instance, retrying on connection errors.
+
+    Newly provisioned containers may need a few seconds to start serving.
+    This retries with a short delay to avoid returning 502 on first access.
+    """
+    client = await _get_proxy_client()
+    url = f"http://{instance.host}:{instance.port}/openapi.json"
+    headers = {"Authorization": f"Bearer {instance.api_key}"}
+
+    last_err = None
+    for attempt in range(_SPEC_FETCH_RETRIES):
+        try:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            if attempt < _SPEC_FETCH_RETRIES - 1:
+                logger.debug("Spec fetch attempt {} failed ({}), retrying...", attempt + 1, e)
+                await asyncio.sleep(_SPEC_FETCH_DELAY)
+    raise last_err
+
+
+def _strip_auth_from_spec(spec: dict) -> None:
+    """Remove security schemes — auth is handled transparently by the proxy."""
+    spec.pop("security", None)
+    spec.get("components", {}).pop("securitySchemes", None)
+    for _path_methods in spec.get("paths", {}).values():
+        for _op in _path_methods.values():
+            if isinstance(_op, dict):
+                _op.pop("security", None)
+
 
 @router.get(
     "/openapi.json",
@@ -191,14 +247,8 @@ async def get_openapi_spec(request: Request):
     # Provision a system instance to fetch the spec from.
     instance = await _resolve_instance(request, _SYSTEM_USER_ID)
 
-    client = await _get_proxy_client()
     try:
-        resp = await client.get(
-            f"http://{instance.host}:{instance.port}/openapi.json",
-            headers={"Authorization": f"Bearer {instance.api_key}"},
-        )
-        resp.raise_for_status()
-        spec = resp.json()
+        spec = await _fetch_spec_with_retry(instance)
     except Exception as e:
         logger.error("Failed to fetch OpenAPI spec from instance: {}", e)
         return JSONResponse(
@@ -206,15 +256,7 @@ async def get_openapi_spec(request: Request):
             status_code=502,
         )
 
-    # Strip security schemes and per-operation security requirements.
-    # Auth is handled transparently by the orchestrator proxy — the model
-    # should not see or ask for Bearer tokens.
-    spec.pop("security", None)
-    spec.get("components", {}).pop("securitySchemes", None)
-    for _path_methods in spec.get("paths", {}).values():
-        for _op in _path_methods.values():
-            if isinstance(_op, dict):
-                _op.pop("security", None)
+    _strip_auth_from_spec(spec)
 
     _cached_spec = spec
     _cached_spec_ts = now
@@ -259,14 +301,8 @@ async def policy_openapi_spec(
     _id, spec = await _resolve_policy_spec(policy_id)
     instance = await _resolve_instance(request, _SYSTEM_USER_ID, policy_id=_id, spec=spec)
 
-    client = await _get_proxy_client()
     try:
-        resp = await client.get(
-            f"http://{instance.host}:{instance.port}/openapi.json",
-            headers={"Authorization": f"Bearer {instance.api_key}"},
-        )
-        resp.raise_for_status()
-        spec_data = resp.json()
+        spec_data = await _fetch_spec_with_retry(instance)
     except Exception as e:
         logger.error("Failed to fetch OpenAPI spec from policy instance: {}", e)
         return JSONResponse(
@@ -274,13 +310,7 @@ async def policy_openapi_spec(
             status_code=502,
         )
 
-    # Strip auth from spec — orchestrator handles auth transparently.
-    spec_data.pop("security", None)
-    spec_data.get("components", {}).pop("securitySchemes", None)
-    for _path_methods in spec_data.get("paths", {}).values():
-        for _op in _path_methods.values():
-            if isinstance(_op, dict):
-                _op.pop("security", None)
+    _strip_auth_from_spec(spec_data)
 
     return JSONResponse(content=spec_data)
 
@@ -384,8 +414,24 @@ async def _ws_proxy_handler(
 
     upstream_url = f"ws://{instance.host}:{instance.port}/api/terminals/{session_id}"
 
+    # Retry WebSocket connection — the container may still be starting.
+    max_retries = 5
+    upstream = None
+    for attempt in range(max_retries):
+        try:
+            upstream = await websockets.connect(upstream_url)
+            break
+        except (ConnectionRefusedError, OSError) as e:
+            if attempt < max_retries - 1:
+                logger.debug("WS connect attempt {} to {} failed ({}), retrying...", attempt + 1, upstream_url, e)
+                await asyncio.sleep(1)
+            else:
+                logger.error("WS connect to {} failed after {} retries: {}", upstream_url, max_retries, e)
+                await ws.close(code=4003, reason="Terminal instance not reachable")
+                return
+
     try:
-        async with websockets.connect(upstream_url) as upstream:
+        async with upstream:
             await upstream.send(json.dumps({"type": "auth", "token": instance.api_key}))
 
             async def _client_to_upstream():
