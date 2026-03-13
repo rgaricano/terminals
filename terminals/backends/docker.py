@@ -32,7 +32,7 @@ class DockerBackend(Backend):
     @staticmethod
     def _container_name(policy_id: str, user_id: str) -> str:
         """Build the deterministic container name."""
-        return f"{_CONTAINER_PREFIX}{policy_id}--{user_id}"
+        return f"{_CONTAINER_PREFIX}{policy_id}-{user_id}"
 
     # ------------------------------------------------------------------
     # Backend interface
@@ -83,6 +83,11 @@ class DockerBackend(Backend):
             "Env": env,
             "HostConfig": host_config,
             "ExposedPorts": {"8000/tcp": {}},
+            "Labels": {
+                "app.kubernetes.io/managed-by": "terminals",
+                "openwebui.com/user-id": user_id,
+                "openwebui.com/policy": policy_id,
+            },
         }
 
         log.info("Provisioning container %s for user %s (policy=%s)", instance_name, user_id, policy_id)
@@ -178,31 +183,30 @@ class DockerBackend(Backend):
         """Scan running Docker containers and repopulate ``_instances``.
 
         Called during startup to recover state after a restart without
-        tearing down existing containers.  The API key stored in each
-        container's env (``OPEN_TERMINAL_API_KEY``) is extracted so the
-        proxy can authenticate against the instance.
+        tearing down existing containers.  Uses Docker labels to identify
+        user_id and policy_id.  The API key is read from the container's
+        ``OPEN_TERMINAL_API_KEY`` env var.
         """
         docker = await self._get_docker()
         containers = await docker.containers.list(
-            filters={"name": [_CONTAINER_PREFIX], "status": ["running"]},
+            filters={
+                "label": ["app.kubernetes.io/managed-by=terminals"],
+                "status": ["running"],
+            },
         )
 
         recovered = 0
         for container in containers:
             info = await container.show()
             name = info.get("Name", "").lstrip("/")
+            labels = info.get("Config", {}).get("Labels", {})
 
-            if not name.startswith(_CONTAINER_PREFIX):
+            user_id = labels.get("openwebui.com/user-id")
+            policy_id = labels.get("openwebui.com/policy", "default")
+            if not user_id:
+                log.debug("Skipping container %s: no user-id label", name)
                 continue
 
-            # Parse: terminals-{policy_id}--{user_id}
-            suffix = name[len(_CONTAINER_PREFIX):]
-            parts = suffix.split("--", 1)
-            if len(parts) != 2:
-                log.debug("Skipping container with unexpected name: %s", name)
-                continue
-
-            policy_id, user_id = parts
             key = self._key(user_id, policy_id)
 
             # Already tracked

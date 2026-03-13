@@ -278,6 +278,9 @@ class KubernetesBackend(Backend):
 
         host = f"{name}.{ns}.svc.cluster.local"
 
+        # Wait for the pod to be ready before returning.
+        await self._wait_until_pod_ready(core, name, ns, timeout=60)
+
         return {
             "instance_id": instance_id,
             "instance_name": name,
@@ -285,6 +288,30 @@ class KubernetesBackend(Backend):
             "host": host,
             "port": 8000,
         }
+
+    async def _wait_until_pod_ready(
+        self,
+        core: client.CoreV1Api,
+        name: str,
+        ns: str,
+        timeout: int = 60,
+    ) -> None:
+        """Poll until the pod's readiness probe passes."""
+        import asyncio
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                pod = await core.read_namespaced_pod(name, ns)
+                conditions = pod.status.conditions or []
+                for c in conditions:
+                    if c.type == "Ready" and c.status == "True":
+                        log.info("Pod %s is ready", name)
+                        return
+            except client.exceptions.ApiException:
+                pass
+            await asyncio.sleep(1)
+        log.warning("Pod %s did not become ready within %ds", name, timeout)
 
     async def start(self, instance_id: str) -> bool:
         current = await self.status(instance_id)
