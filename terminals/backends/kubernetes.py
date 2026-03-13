@@ -333,6 +333,9 @@ class KubernetesBackend(Backend):
         except client.exceptions.ApiException:
             log.warning("Could not delete Service %s", name)
 
+        # Clean up UID cache.
+        self._uid_cache.pop(instance_id, None)
+
         # Note: PVC is intentionally kept for data persistence.
 
     async def status(self, instance_id: str) -> str:

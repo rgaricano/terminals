@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiodocker
+import httpx
 
 from terminals.backends.base import Backend
 from terminals.config import settings
@@ -92,29 +93,28 @@ class DockerBackend(Backend):
 
         log.info("Provisioning container %s for user %s (policy=%s)", instance_name, user_id, policy_id)
 
-        try:
-            container = await docker.containers.create_or_replace(
-                name=instance_name,
-                config=config,
-            )
-            await container.start()
-        except aiodocker.exceptions.DockerError as exc:
-            if exc.status == 409:
-                # Container name conflict (e.g. stale container being removed).
-                # Force-remove and retry.
-                log.warning("Container %s conflict, force-removing and retrying", instance_name)
-                try:
-                    old = await docker.containers.get(instance_name)
-                    await old.delete(force=True)
-                except aiodocker.exceptions.DockerError:
-                    pass
-                await asyncio.sleep(1)
+        max_conflict_retries = 3
+        for attempt in range(max_conflict_retries + 1):
+            try:
                 container = await docker.containers.create_or_replace(
                     name=instance_name,
                     config=config,
                 )
                 await container.start()
-            else:
+                break
+            except aiodocker.exceptions.DockerError as exc:
+                if exc.status == 409 and attempt < max_conflict_retries:
+                    log.warning(
+                        "Container %s conflict (attempt %d/%d), force-removing and retrying",
+                        instance_name, attempt + 1, max_conflict_retries,
+                    )
+                    try:
+                        old = await docker.containers.get(instance_name)
+                        await old.delete(force=True)
+                    except aiodocker.exceptions.DockerError:
+                        pass
+                    await asyncio.sleep(1)
+                    continue
                 log.error("Failed to provision container for %s: %s", user_id, exc)
                 raise
 
@@ -124,7 +124,6 @@ class DockerBackend(Backend):
 
     async def _wait_until_ready(self, instance: dict, timeout: int = 15) -> None:
         """Poll the container's /health endpoint until it responds."""
-        import httpx
 
         url = f"http://{instance['host']}:{instance['port']}/health"
         deadline = asyncio.get_event_loop().time() + timeout

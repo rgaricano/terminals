@@ -143,7 +143,6 @@ async def _proxy_request(
     client = await _get_proxy_client()
 
     # Retry on connection errors — the container may still be starting.
-    import httpx
     max_retries = 5
     for attempt in range(max_retries):
         try:

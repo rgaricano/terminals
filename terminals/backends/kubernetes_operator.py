@@ -495,54 +495,75 @@ class KubernetesOperatorBackend(Backend):
     ) -> Optional[dict]:
         """Get or create a terminal, resolving from K8s CRDs.
 
-        Mirrors the reference ``ensure_terminal`` pattern:
-        - If no CR exists → create and wait for ready.
-        - If Idle → delete CR and re-create (operator spawns fresh pod).
-        - If Running → return connection info immediately.
-        - If Pending/Provisioning → wait for ready.
+        Uses a per-key lock so concurrent requests for the same user+policy
+        don't race to create the same CR.
 
         Returns a dict with ``api_key``, ``host``, ``port`` or ``None``.
         """
+        key = self._key(user_id, policy_id)
+
+        # Fast path — check if CR is already Running (no lock needed).
         cr = await self._get_terminal_cr(user_id, policy_id)
+        if cr:
+            status = cr.get("status") or {}
+            phase = status.get("phase")
+            if phase == "Running" and status.get("serviceUrl") and status.get("apiKeySecret"):
+                api_key = await self._read_api_key_from_secret(status["apiKeySecret"])
+                if api_key:
+                    host, port = self._parse_service_url(status["serviceUrl"])
+                    return {
+                        "instance_id": cr["metadata"]["uid"],
+                        "instance_name": cr["metadata"]["name"],
+                        "api_key": api_key,
+                        "host": host,
+                        "port": port,
+                    }
 
-        if cr is None:
-            return await self.provision(user_id, policy_id=policy_id, spec=spec)
+        # Serialise provisioning per key.
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
 
-        status = cr.get("status") or {}
-        phase = status.get("phase")
+        async with self._locks[key]:
+            # Re-check after acquiring lock.
+            cr = await self._get_terminal_cr(user_id, policy_id)
 
-        if phase == "Idle":
-            # Terminal was idled — delete and re-create to spawn a fresh pod
-            await self._delete_terminal_cr(user_id, policy_id)
-            return await self.provision(user_id, policy_id=policy_id, spec=spec)
+            if cr is None:
+                return await self.provision(user_id, policy_id=policy_id, spec=spec)
 
-        if phase == "Running" and status.get("serviceUrl") and status.get("apiKeySecret"):
-            api_key = await self._read_api_key_from_secret(status["apiKeySecret"])
-            if api_key:
-                host, port = self._parse_service_url(status["serviceUrl"])
+            status = cr.get("status") or {}
+            phase = status.get("phase")
+
+            if phase == "Idle":
+                await self._delete_terminal_cr(user_id, policy_id)
+                return await self.provision(user_id, policy_id=policy_id, spec=spec)
+
+            if phase == "Running" and status.get("serviceUrl") and status.get("apiKeySecret"):
+                api_key = await self._read_api_key_from_secret(status["apiKeySecret"])
+                if api_key:
+                    host, port = self._parse_service_url(status["serviceUrl"])
+                    return {
+                        "instance_id": cr["metadata"]["uid"],
+                        "instance_name": cr["metadata"]["name"],
+                        "api_key": api_key,
+                        "host": host,
+                        "port": port,
+                    }
+
+            # Still provisioning — wait for the operator to bring it up
+            name = cr["metadata"]["name"]
+            ns = settings.kubernetes_namespace
+            ready = await self._wait_for_ready(name, ns, timeout=120)
+            if ready:
+                host, port = self._parse_service_url(ready["service_url"])
                 return {
                     "instance_id": cr["metadata"]["uid"],
                     "instance_name": cr["metadata"]["name"],
-                    "api_key": api_key,
+                    "api_key": ready["api_key"],
                     "host": host,
                     "port": port,
                 }
 
-        # Still provisioning — wait for the operator to bring it up
-        name = cr["metadata"]["name"]
-        ns = settings.kubernetes_namespace
-        ready = await self._wait_for_ready(name, ns, timeout=120)
-        if ready:
-            host, port = self._parse_service_url(ready["service_url"])
-            return {
-                "instance_id": cr["metadata"]["uid"],
-                "instance_name": cr["metadata"]["name"],
-                "api_key": ready["api_key"],
-                "host": host,
-                "port": port,
-            }
-
-        return None
+            return None
 
     async def get_terminal_info(self, user_id: str) -> Optional[dict]:
         """Look up an existing terminal from the K8s CRD without creating one."""
