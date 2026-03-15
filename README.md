@@ -108,4 +108,4 @@ See [`config.py`](terminals/config.py) for the full list.
 
 ## License
 
-[Open WebUI Enterprise License](LICENSE) — production use requires an enterprise plan that includes Terminals.
+[Open WebUI Enterprise License](LICENSE)
