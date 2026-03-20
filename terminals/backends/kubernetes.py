@@ -1,6 +1,7 @@
 """Kubernetes backend — provisions Open Terminal as Pods via the K8s API."""
 
 import asyncio
+import base64
 import logging
 import re
 import secrets
@@ -97,9 +98,34 @@ class KubernetesBackend(Backend):
         storage_mode = s.get("storage_mode", settings.kubernetes_storage_mode)
         storage_size = s.get("storage", settings.kubernetes_storage_size)
 
+        # ---- Secret (API key) --------------------------------------------
+        secret_name = f"{name}-apikey"
+        secret = client.V1Secret(
+            metadata=client.V1ObjectMeta(name=secret_name, namespace=ns, labels=labels),
+            string_data={"api-key": api_key},
+        )
+        try:
+            await core.create_namespaced_secret(ns, secret)
+            log.info("Created Secret %s in %s", secret_name, ns)
+        except client.exceptions.ApiException as exc:
+            if exc.status == 409:
+                # Secret exists — delete and recreate with new key.
+                await core.delete_namespaced_secret(secret_name, ns)
+                await core.create_namespaced_secret(ns, secret)
+                log.info("Replaced Secret %s in %s", secret_name, ns)
+            else:
+                raise
+
         # ---- Env vars ----------------------------------------------------
         env_vars = [
-            client.V1EnvVar(name="OPEN_TERMINAL_API_KEY", value=api_key),
+            client.V1EnvVar(
+                name="OPEN_TERMINAL_API_KEY",
+                value_from=client.V1EnvVarSource(
+                    secret_key_ref=client.V1SecretKeySelector(
+                        name=secret_name, key="api-key",
+                    ),
+                ),
+            ),
         ]
         policy_env = s.get("env", {})
         for k, v in policy_env.items():
@@ -333,7 +359,13 @@ class KubernetesBackend(Backend):
             log.info("Deleted Service %s", name)
         except client.exceptions.ApiException:
             log.warning("Could not delete Service %s", name)
-
+        # Delete Secret.
+        secret_name = f"{name}-apikey"
+        try:
+            await core.delete_namespaced_secret(secret_name, ns)
+            log.info("Deleted Secret %s", secret_name)
+        except client.exceptions.ApiException:
+            log.warning("Could not delete Secret %s (may already be gone)", secret_name)
         # Clean up UID cache.
         self._uid_cache.pop(instance_id, None)
 
@@ -414,18 +446,18 @@ class KubernetesBackend(Backend):
             if key in self._instances:
                 continue
 
-            # Extract API key from pod env
+            # Read API key from the companion Secret
+            secret_name = f"{name}-apikey"
             api_key = None
-            for container in pod.spec.containers:
-                for env in (container.env or []):
-                    if env.name == "OPEN_TERMINAL_API_KEY" and env.value:
-                        api_key = env.value
-                        break
-                if api_key:
-                    break
+            try:
+                secret = await core.read_namespaced_secret(secret_name, ns)
+                raw = secret.data.get("api-key", "")
+                api_key = base64.b64decode(raw).decode() if raw else None
+            except client.exceptions.ApiException:
+                pass
 
             if not api_key:
-                log.debug("Pod %s has no API key, skipping", name)
+                log.debug("Pod %s has no API key secret, skipping", name)
                 continue
 
             host = f"{name}.{ns}.svc.cluster.local"
