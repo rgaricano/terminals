@@ -533,7 +533,12 @@ class KubernetesOperatorBackend(Backend):
             status = cr.get("status") or {}
             phase = status.get("phase")
 
-            if phase == "Idle":
+            if phase in ("Idle", "Error"):
+                log.info(
+                    "Terminal CR %s in phase %s — deleting and re-provisioning",
+                    cr["metadata"]["name"],
+                    phase,
+                )
                 await self._delete_terminal_cr(user_id, policy_id)
                 return await self.provision(user_id, policy_id=policy_id, spec=spec)
 
